@@ -35,8 +35,17 @@ struct fscache_netfs ceph_cache_netfs = {
 	.version	= 0,
 };
 
-static uint16_t ceph_fscache_session_get_key(const void *cookie_netfs_data,
-					     void *buffer, uint16_t maxbuf)
+static DEFINE_MUTEX(ceph_fscache_fsid_lock);
+static LIST_HEAD(ceph_fscache_fsid_list);
+
+struct ceph_fscache_fsid {
+	struct list_head list;
+	struct fscache_cookie *fscache;
+	struct ceph_fsid fsid;
+};
+
+static uint16_t ceph_fscache_fsid_get_key(const void *cookie_netfs_data,
+					  void *buffer, uint16_t maxbuf)
 {
 	const struct ceph_fs_client* fsc = cookie_netfs_data;
 	uint16_t klen;
@@ -52,7 +61,32 @@ static uint16_t ceph_fscache_session_get_key(const void *cookie_netfs_data,
 static const struct fscache_cookie_def ceph_fscache_fsid_object_def = {
 	.name		= "CEPH.fsid",
 	.type		= FSCACHE_COOKIE_TYPE_INDEX,
-	.get_key	= ceph_fscache_session_get_key,
+	.get_key	= ceph_fscache_fsid_get_key,
+};
+
+static uint16_t ceph_fscache_client_get_key(const void *cookie_netfs_data,
+					    void *buffer, uint16_t maxbuf)
+{
+	const struct ceph_fs_client* fsc = cookie_netfs_data;
+	const struct ceph_fsid *fsid = &fsc->client->fsid;
+	u64 client_id = fsc->client->monc.auth->global_id;
+	uint16_t fsid_len, key_len;
+
+	fsid_len = sizeof(*fsid);
+	key_len = fsid_len + sizeof(client_id);
+	if (key_len > maxbuf)
+		return 0;
+
+	memcpy(buffer, fsid, fsid_len);
+	memcpy(buffer + fsid_len, &client_id, sizeof(client_id));
+
+	return key_len;
+}
+
+static const struct fscache_cookie_def ceph_fscache_client_object_def = {
+	.name		= "CEPH.client",
+	.type		= FSCACHE_COOKIE_TYPE_INDEX,
+	.get_key	= ceph_fscache_client_get_key,
 };
 
 int ceph_fscache_register(void)
@@ -67,13 +101,54 @@ void ceph_fscache_unregister(void)
 
 int ceph_fscache_register_fs(struct ceph_fs_client* fsc)
 {
-	fsc->fscache = fscache_acquire_cookie(ceph_cache_netfs.primary_index,
-					      &ceph_fscache_fsid_object_def,
-					      fsc, true);
-	if (!fsc->fscache)
-		pr_err("Unable to register fsid: %p fscache cookie\n", fsc);
+	const struct ceph_fsid *fsid = &fsc->client->fsid;
+	struct ceph_fscache_fsid *ent;
+	int err = 0;
 
-	return 0;
+	if (fsc->mount_options->flags & CEPH_MOUNT_OPT_TMPFSCACHE) {
+		fsc->fscache = fscache_acquire_cookie(
+						ceph_cache_netfs.primary_index,
+						&ceph_fscache_client_object_def,
+						fsc, true);
+		if (!fsc->fscache)
+			pr_err("Unable to register fsid: %p "
+			       "fscache cookie\n", fsc);
+	} else {
+		mutex_lock(&ceph_fscache_fsid_lock);
+		list_for_each_entry(ent, &ceph_fscache_fsid_list, list) {
+			if (!memcmp(&ent->fsid, fsid, sizeof(*fsid))) {
+				pr_err("fscache cookie already registered "
+				       "for fsid %pU\n", fsid);
+				pr_err("  use tmpfsc mount option instead\n");
+				err = -EBUSY;
+				goto out_unlock;
+			}
+		}
+
+		ent = kzalloc(sizeof(*ent), GFP_KERNEL);
+		if (!ent) {
+			err = -ENOMEM;
+			goto out_unlock;
+		}
+
+		fsc->fscache = fscache_acquire_cookie(
+						ceph_cache_netfs.primary_index,
+						&ceph_fscache_fsid_object_def,
+						fsc, true);
+
+		if (fsc->fscache) {
+			memcpy(&ent->fsid, fsid, sizeof(*fsid));
+			ent->fscache = fsc->fscache;
+			list_add_tail(&ent->list, &ceph_fscache_fsid_list);
+		} else {
+			kfree(ent);
+			pr_err("Unable to register fsid: %p "
+			       "fscache cookie\n", fsc);
+		}
+out_unlock:
+		mutex_unlock(&ceph_fscache_fsid_lock);
+	}
+	return err;
 }
 
 static uint16_t ceph_fscache_inode_get_key(const void *cookie_netfs_data,
@@ -349,7 +424,29 @@ void ceph_invalidate_fscache_page(struct inode* inode, struct page *page)
 
 void ceph_fscache_unregister_fs(struct ceph_fs_client* fsc)
 {
-	fscache_relinquish_cookie(fsc->fscache, 0);
+	if (fscache_cookie_valid(fsc->fscache)) {
+		if (fsc->fscache->def == &ceph_fscache_fsid_object_def) {
+			const struct ceph_fsid *fsid = &fsc->client->fsid;
+			struct ceph_fscache_fsid *ent, *found = NULL;
+
+			mutex_lock(&ceph_fscache_fsid_lock);
+			list_for_each_entry(ent, &ceph_fscache_fsid_list, list) {
+				if (!memcmp(&ent->fsid, fsid, sizeof(*fsid))) {
+					found = ent;
+					break;
+				}
+			}
+			if (found) {
+				WARN_ON_ONCE(found->fscache != fsc->fscache);
+				list_del(&found->list);
+				kfree(found);
+			} else {
+				WARN_ON_ONCE(true);
+			}
+			mutex_unlock(&ceph_fscache_fsid_lock);
+		}
+		__fscache_relinquish_cookie(fsc->fscache, 0);
+	}
 	fsc->fscache = NULL;
 }
 

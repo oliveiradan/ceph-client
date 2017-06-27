@@ -36,8 +36,9 @@
 #define CEPH_MOUNT_OPT_INO32           (1<<8) /* 32 bit inos */
 #define CEPH_MOUNT_OPT_DCACHE          (1<<9) /* use dcache for readdir etc */
 #define CEPH_MOUNT_OPT_FSCACHE         (1<<10) /* use fscache */
-#define CEPH_MOUNT_OPT_NOPOOLPERM      (1<<11) /* no pool permission check */
-#define CEPH_MOUNT_OPT_MOUNTWAIT       (1<<12) /* mount waits if no mds is up */
+#define CEPH_MOUNT_OPT_TMPFSCACHE      (1<<11) /* use temp fscache */
+#define CEPH_MOUNT_OPT_NOPOOLPERM      (1<<12) /* no pool permission check */
+#define CEPH_MOUNT_OPT_MOUNTWAIT       (1<<13) /* mount waits if no mds is up */
 
 #define CEPH_MOUNT_OPT_DEFAULT    CEPH_MOUNT_OPT_DCACHE
 

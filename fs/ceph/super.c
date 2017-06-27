@@ -134,6 +134,7 @@ enum {
 	Opt_ino32,
 	Opt_noino32,
 	Opt_fscache,
+	Opt_tmpfscache,
 	Opt_nofscache,
 	Opt_poolperm,
 	Opt_nopoolperm,
@@ -170,6 +171,7 @@ static match_table_t fsopt_tokens = {
 	{Opt_ino32, "ino32"},
 	{Opt_noino32, "noino32"},
 	{Opt_fscache, "fsc"},
+	{Opt_tmpfscache, "tmpfsc"},
 	{Opt_nofscache, "nofsc"},
 	{Opt_poolperm, "poolperm"},
 	{Opt_nopoolperm, "nopoolperm"},
@@ -280,6 +282,10 @@ static int parse_fsopt_token(char *c, void *private)
 		break;
 	case Opt_fscache:
 		fsopt->flags |= CEPH_MOUNT_OPT_FSCACHE;
+		break;
+	case Opt_tmpfscache:
+		fsopt->flags |= CEPH_MOUNT_OPT_FSCACHE |
+				CEPH_MOUNT_OPT_TMPFSCACHE;
 		break;
 	case Opt_nofscache:
 		fsopt->flags &= ~CEPH_MOUNT_OPT_FSCACHE;
@@ -475,8 +481,12 @@ static int ceph_show_options(struct seq_file *m, struct dentry *root)
 		seq_puts(m, ",noasyncreaddir");
 	if ((fsopt->flags & CEPH_MOUNT_OPT_DCACHE) == 0)
 		seq_puts(m, ",nodcache");
-	if (fsopt->flags & CEPH_MOUNT_OPT_FSCACHE)
-		seq_puts(m, ",fsc");
+	if (fsopt->flags & CEPH_MOUNT_OPT_FSCACHE) {
+		if (fsopt->flags & CEPH_MOUNT_OPT_TMPFSCACHE)
+			seq_puts(m, ",tmpfsc");
+		else
+			seq_puts(m, ",fsc");
+	}
 	if (fsopt->flags & CEPH_MOUNT_OPT_NOPOOLPERM)
 		seq_puts(m, ",nopoolperm");
 
@@ -597,18 +607,11 @@ static struct ceph_fs_client *create_fs_client(struct ceph_mount_options *fsopt,
 	if (!fsc->wb_pagevec_pool)
 		goto fail_trunc_wq;
 
-	/* setup fscache */
-	if ((fsopt->flags & CEPH_MOUNT_OPT_FSCACHE) &&
-	    (ceph_fscache_register_fs(fsc) != 0))
-		goto fail_fscache;
-
 	/* caps */
 	fsc->min_caps = fsopt->max_readdir;
 
 	return fsc;
 
-fail_fscache:
-	ceph_fscache_unregister_fs(fsc);
 fail_trunc_wq:
 	destroy_workqueue(fsc->trunc_wq);
 fail_pg_inv_wq:
@@ -625,8 +628,6 @@ fail:
 static void destroy_fs_client(struct ceph_fs_client *fsc)
 {
 	dout("destroy_fs_client %p\n", fsc);
-
-	ceph_fscache_unregister_fs(fsc);
 
 	destroy_workqueue(fsc->wb_wq);
 	destroy_workqueue(fsc->pg_inv_wq);
@@ -819,6 +820,13 @@ static struct dentry *ceph_real_mount(struct ceph_fs_client *fsc)
 		err = __ceph_open_session(fsc->client, started);
 		if (err < 0)
 			goto out;
+
+		/* setup fscache */
+		if (fsc->mount_options->flags & CEPH_MOUNT_OPT_FSCACHE) {
+			err = ceph_fscache_register_fs(fsc);
+			if (err < 0)
+				goto out;
+		}
 
 		if (!fsc->mount_options->server_path) {
 			path = "";
@@ -1041,6 +1049,8 @@ static void ceph_kill_sb(struct super_block *s)
 
 	fsc->client->extra_mon_dispatch = NULL;
 	ceph_fs_debugfs_cleanup(fsc);
+
+	ceph_fscache_unregister_fs(fsc);
 
 	ceph_mdsc_destroy(fsc);
 
